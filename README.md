@@ -2,8 +2,7 @@
 
 Написан на [OneScript](https://github.com/EvilBeaver/OneScript). Вдохновлен [winow](https://github.com/autumn-library/winow)
 
-Для работы прокси-сервера необходимо установить и настроить [TCP сервер хранилищ 1С](https://wiseadvice-it.ru/o-kompanii/blog/articles/
-hranilishhe-konfiguracii-v-1s-8-3-ustanovka-i-nastroika/)
+Для работы прокси-сервера необходимо установить и настроить [TCP сервер хранилищ 1С](https://wiseadvice-it.ru/o-kompanii/blog/articles/hranilishhe-konfiguracii-v-1s-8-3-ustanovka-i-nastroika/)
 
 Прокси-сервер:
 - Не работает с файловым вариантом хранилища
