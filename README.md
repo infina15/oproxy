@@ -1,3 +1,4 @@
+[![Тестирование](https://github.com/infina15/oproxy/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/infina15/oproxy/actions/workflows/test.yml)
 ## oproxy - TCP прокси-сервер хранилища конфигураций 1С
 
 Написан на [OneScript](https://github.com/EvilBeaver/OneScript). Вдохновлен [winow](https://github.com/autumn-library/winow)
