@@ -4,5 +4,21 @@
             "8.3.22.2411": 1542,
             "8.3.23.1865": 1543
         }
+    },
+    "logos": {
+        "logger": {
+            "oscript.app.oproxy": {"level":"DEBUG", "stringlayout":"%ДатаВремя%: %Уровень% - %Сообщение%", "appenders": ["debugfile", "consoledebug"]}
+        },
+        "appender": {
+            "consoledebug": {
+                "type": "ВыводЛогаВКонсоль",
+                "level": "DEBUG"
+            },
+            "debugfile": {
+                "type": "ВыводЛогаВФайл",
+                "level": "DEBUG",
+                "file": "E:\\oproxy_catalog\\oproxy.log"
+            }
+        }
     }
 }
