@@ -66,9 +66,10 @@ def split_send(sock, data, cuts):
 
 
 class Proxy:
-    def __init__(self, *, writable_temp=True):
+    def __init__(self, *, writable_temp=True, env=None):
         self.resources = contextlib.ExitStack()
         self.writable_temp = writable_temp
+        self.env = env or {}
 
     def __enter__(self):
         try:
@@ -101,7 +102,7 @@ class Proxy:
              "--proxy-port", str(self.port), "--storage-server", "127.0.0.1",
              "--storage-port", str(self.storage.getsockname()[1]), "--check-file", str(hook)],
             stdout=output, stderr=subprocess.STDOUT, cwd=ROOT,
-            env=dict(os.environ, TMP=process_temp, TEMP=process_temp, TMPDIR=process_temp),
+            env=dict(os.environ, TMP=process_temp, TEMP=process_temp, TMPDIR=process_temp, **self.env),
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.resources.callback(self.stop)
         deadline = time.monotonic() + 15
@@ -312,8 +313,55 @@ class Connections(unittest.TestCase):
                 time.sleep(1.6)
                 peer.sendall(response())
                 receive(slow, response())
-                peer.close()
-                eof(slow)
+                slow.close()
+                eof(peer)
+
+    def test_storage_idle_disconnect_reconnects(self):
+        packet = request()
+        with Proxy() as proxy, proxy.client() as client:
+            # Before the watchdog notices the closed storage leg, and after it has released it.
+            for pause in (0.3, 2.5):
+                client.sendall(packet)
+                with proxy.peer() as peer:
+                    receive(peer, packet)
+                    peer.sendall(response())
+                    receive(client, response())
+                time.sleep(pause)
+            client.sendall(packet)
+            with proxy.peer() as peer:
+                receive(peer, packet)
+                peer.sendall(response())
+                receive(client, response())
+            self.assertEqual(proxy.logs().count("подключаюсь заново"), 2)
+
+    def test_idle_client_receives_probe(self):
+        packet = request()
+        with Proxy(env={"oproxy_client_probe": "1"}) as proxy, proxy.client() as client:
+            client.sendall(packet)
+            with proxy.peer() as peer:
+                receive(peer, packet)
+                peer.sendall(response())
+                receive(client, response())
+                time.sleep(2.6)
+                client.settimeout(0.5)
+                probes = bytearray()
+                with contextlib.suppress(socket.timeout):
+                    while part := client.recv(4096):
+                        probes.extend(part)
+                self.assertGreaterEqual(len(probes) // len(PING), 1)
+                self.assertEqual(bytes(probes), PING * (len(probes) // len(PING)))
+                # A probe may still precede the reply, as storage pings do.
+                client.settimeout(5)
+                client.sendall(packet)
+                receive(peer, packet)
+                peer.sendall(response())
+                reply = bytearray()
+                while not reply.endswith(response()):
+                    part = client.recv(4096)
+                    self.assertTrue(part)
+                    reply.extend(part)
+                pings = reply[:-len(response())]
+                self.assertEqual(bytes(pings), PING * (len(pings) // len(PING)))
 
     def test_storage_recovers_after_connection_refused(self):
         with Proxy() as proxy:
