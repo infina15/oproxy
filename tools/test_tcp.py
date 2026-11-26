@@ -1,5 +1,6 @@
 """Интеграционные проверки локального экземпляра oproxy."""
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import ctypes
 from ctypes import wintypes
 import os
@@ -592,14 +593,66 @@ def memory_test():
             receive(active, response())
         proxy.exchange()
     # Warm up the managed heap and the connection workers for two batches.
-    baseline = results[1]
-    last = results[-1]
+    assert_stable_resources(results[1], results[-1])
+
+
+def assert_stable_resources(baseline, last):
     if last[0] > baseline[0] + 8 * 2**20 or last[1] > baseline[1] + 12 or last[2] > baseline[2] + 2:
         raise AssertionError("process resources grew beyond their post-warm-up range")
+
+
+def disconnect_burst(proxy, executor, limit, fragment):
+    with contextlib.ExitStack() as clients:
+        pending = [executor.submit(proxy.client) for _ in range(limit - 1)]
+        occupied = [clients.enter_context(future.result(timeout=8)) for future in pending]
+        for client in occupied:
+            client.sendall(fragment)
+        # One control session plus the occupied clients hold every worker.
+        with socket.create_connection(("127.0.0.1", proxy.port), 5) as queued:
+            queued.settimeout(0.06)
+            try:
+                queued.recv(1)
+            except socket.timeout:
+                pass
+            else:
+                raise AssertionError("accepted a connection above the worker limit")
+            occupied.pop().close()
+            queued.settimeout(5)
+            receive(queued, HELLO)
+            queued.sendall(fragment)
+        for client in occupied[1::2]:
+            abort(client)
+
+
+def parallel_memory_test():
+    if os.name != "nt":
+        raise SystemExit("--parallel-memory requires Windows process counters")
+    limit = 24
+    packet = request()
+    results = []
+    with Proxy(env={"oproxy_workers": str(limit)}, writable_temp=False) as proxy, proxy.client() as active:
+        active.sendall(packet)
+        with proxy.peer() as peer, ThreadPoolExecutor(max_workers=limit) as executor:
+            receive(peer, packet)
+            print("count   private MiB    WS MiB  handles  jobs  finished   sockets  estab  close_wait")
+            for batch in range(1, 201):
+                disconnect_burst(proxy, executor, limit, packet[:-32])
+                if batch == 34 or batch % 25 == 0 and batch >= 50:
+                    sample = checkpoint(proxy, batch * limit)
+                    if sample[2] != limit:
+                        raise AssertionError("worker pool changed size after reaching the limit")
+                    results.append(sample)
+            peer.sendall(response())
+            receive(active, response())
+        proxy.exchange()
+    # The first post-warm-up sample follows 816 connections, the last follows 4,800.
+    assert_stable_resources(results[0], results[-1])
 
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--memory"]:
         memory_test()
+    elif sys.argv[1:] == ["--parallel-memory"]:
+        parallel_memory_test()
     else:
         unittest.main()
