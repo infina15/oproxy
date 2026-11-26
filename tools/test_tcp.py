@@ -310,6 +310,27 @@ class Connections(unittest.TestCase):
             self.assertNotIn("POST частями", proxy.logs())
             proxy.exchange()
 
+    def test_worker_limit_queues_and_reuses_connections(self):
+        for limit in (2, 6):
+            with self.subTest(limit=limit), Proxy(env={"oproxy_workers": str(limit)}) as proxy:
+                with contextlib.ExitStack() as clients:
+                    occupied = [clients.enter_context(proxy.client()) for _ in range(limit)]
+                    with socket.create_connection(("127.0.0.1", proxy.port), 5) as queued:
+                        queued.settimeout(0.75)
+                        with self.assertRaises(socket.timeout):
+                            queued.recv(1)
+                        occupied[0].close()
+                        queued.settimeout(5)
+                        receive(queued, HELLO)
+                        packet = request("snapshot")
+                        queued.sendall(packet)
+                        with proxy.peer() as storage:
+                            receive(storage, packet)
+                            storage.sendall(response())
+                            receive(queued, response())
+                        self.assertIn(f"SNAP {limit} 0 0", proxy.logs().splitlines())
+                proxy.exchange()
+
     def test_one_slow_connection_does_not_block_others(self):
         packet = request()
         with Proxy() as proxy, proxy.client() as slow:
