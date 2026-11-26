@@ -9,6 +9,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -147,19 +148,29 @@ class Proxy:
                 client.close()
                 eof(peer)
 
+    def assert_no_storage_connection(self, wait=0.3):
+        self.storage.settimeout(wait)
+        try:
+            sock, _ = self.storage.accept()
+        except socket.timeout:
+            return
+        finally:
+            self.storage.settimeout(5)
+        sock.close()
+        raise AssertionError("unexpected storage connection")
+
     def interrupt_large_request(self, *, reset=False):
         packet = request("tap", "DevDepot_commitObjects", b"A" * (2 * 1024 * 1024))
-        header_end = packet.index(b"\r\n\r\n") + 4
         with self.client() as client:
-            client.sendall(packet[:header_end])
-            with self.peer() as peer:
-                client.sendall(memoryview(packet)[header_end:-128])
-                if reset:
-                    abort(client)
-                else:
-                    # FIN follows the entire incomplete body in TCP byte order.
-                    client.shutdown(socket.SHUT_WR)
-                eof(peer)
+            client.sendall(memoryview(packet)[:-128])
+            if reset:
+                abort(client)
+            else:
+                # FIN follows the entire incomplete body in TCP byte order.
+                client.shutdown(socket.SHUT_WR)
+                eof(client)
+        # A checked request is sent to the storage only once it is complete and checked.
+        self.assert_no_storage_connection(0.05)
 
 
 class Connections(unittest.TestCase):
@@ -170,10 +181,10 @@ class Connections(unittest.TestCase):
         with Proxy() as proxy, proxy.client() as client:
             split_send(client, first[:-2], (1, 3, 15, first.index(b"<?xml") + 2,
                                            first.index(b"commitObjects") + 3, first.index("частями".encode()) + 1))
+            client.sendall(first[-2:] + PING + next_request)
             with proxy.peer(HELLO[:2]) as peer:
                 time.sleep(0.025)
                 peer.sendall(HELLO[2:])
-                client.sendall(first[-2:] + PING + next_request)
                 receive(peer, first)
                 split_send(peer, binary_reply, (3, 19, len(binary_reply) - 1))
                 receive(client, binary_reply)
@@ -209,18 +220,16 @@ class Connections(unittest.TestCase):
     def test_large_checked_body_in_memory(self):
         # Above the 50 MiB threshold at which some OneScript 1.9 binary APIs use the disk.
         packet = request("tap", "DevDepot_commitObjects", b"A" * (52 * 1024 * 1024))
-        header_end = packet.index(b"\r\n\r\n") + 4
         for writable_temp in (True, False):
             with self.subTest(writable_temp=writable_temp), Proxy(writable_temp=writable_temp) as proxy:
                 with proxy.client() as client:
                     client.settimeout(30)
-                    client.sendall(packet[:header_end])
+                    initial_files = set(proxy.log.parent.iterdir())
+                    client.sendall(memoryview(packet)[:-128])
+                    self.assertEqual(set(proxy.log.parent.iterdir()), initial_files)
+                    client.sendall(packet[-128:])
                     with proxy.peer() as peer:
                         peer.settimeout(30)
-                        initial_files = set(proxy.log.parent.iterdir())
-                        client.sendall(memoryview(packet)[header_end:-128])
-                        self.assertEqual(set(proxy.log.parent.iterdir()), initial_files)
-                        client.sendall(packet[-128:])
                         receive(peer, packet)
                         peer.sendall(response())
                         receive(client, response())
@@ -281,9 +290,7 @@ class Connections(unittest.TestCase):
         with Proxy() as proxy:
             with proxy.client() as client:
                 client.sendall(packet[:-4])
-                with proxy.peer() as peer:
-                    client.close()
-                    eof(peer)
+            proxy.assert_no_storage_connection()
             with proxy.client() as client:
                 client.sendall(packet)
                 with proxy.peer() as peer:
@@ -316,6 +323,72 @@ class Connections(unittest.TestCase):
                 slow.close()
                 eof(peer)
 
+    def test_checked_request_connects_after_body(self):
+        packet = request("tap", "DevDepot_commitObjects", b"D" * 65536)
+        with Proxy() as proxy, proxy.client() as client:
+            client.sendall(packet[:-128])
+            # While the body arrives and is checked, the storage leg is not needed yet.
+            proxy.assert_no_storage_connection(0.5)
+            client.sendall(packet[-128:])
+            with proxy.peer() as peer:
+                receive(peer, packet)
+                peer.sendall(response())
+                receive(client, response())
+
+    def test_idle_storage_connection_is_replaced(self):
+        packet = request()
+        with Proxy(env={"oproxy_storage_idle": "1"}) as proxy, proxy.client() as client:
+            client.sendall(packet)
+            with proxy.peer() as first:
+                receive(first, packet)
+                first.sendall(response())
+                receive(client, response())
+                # The proxy does not trust a leg that has been idle too long.
+                eof(first)
+            client.sendall(packet)
+            with proxy.peer() as second:
+                receive(second, packet)
+                second.sendall(response())
+                receive(client, response())
+            self.assertNotIn("прерван", proxy.logs())
+
+    def test_slow_download_survives_storage_close(self):
+        # The storage may close its leg as soon as it has handed over a long reply,
+        # while the proxy is still pushing the tail into a slow client.
+        packet = request()
+        reply = response(bytes(range(256)) * 1024)
+        with Proxy() as proxy, socket.socket() as client:
+            client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            client.connect(("127.0.0.1", proxy.port))
+            client.settimeout(5)
+            receive(client, HELLO)
+            client.sendall(packet)
+            peer = proxy.peer()
+            receive(peer, packet)
+
+            def send_and_close():
+                with peer:
+                    peer.settimeout(60)
+                    peer.sendall(reply)
+
+            sender = threading.Thread(target=send_and_close)
+            sender.start()
+            received = bytearray()
+            while len(received) < len(reply):
+                part = client.recv(2048)
+                self.assertTrue(part, "EOF at %d of %d bytes" % (len(received), len(reply)))
+                received.extend(part)
+                time.sleep(0.05)
+            sender.join()
+            self.assertEqual(bytes(received), reply)
+            # The client leg is still usable, the next request goes over a new storage leg.
+            client.sendall(packet)
+            with proxy.peer() as second:
+                receive(second, packet)
+                second.sendall(response())
+                receive(client, response())
+            self.assertNotIn("прерван", proxy.logs())
+
     def test_storage_idle_disconnect_reconnects(self):
         packet = request()
         with Proxy() as proxy, proxy.client() as client:
@@ -332,7 +405,10 @@ class Connections(unittest.TestCase):
                 receive(peer, packet)
                 peer.sendall(response())
                 receive(client, response())
-            self.assertEqual(proxy.logs().count("подключаюсь заново"), 2)
+            closes = [line for line in proxy.logs().splitlines() if "закрыло соединение после" in line]
+            self.assertEqual(len(closes), 2)
+            for line in closes:
+                self.assertRegex(line, r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} ИНФОРМАЦИЯ - Хранилище ")
 
     def test_idle_client_receives_probe(self):
         packet = request()
@@ -456,10 +532,8 @@ def disconnect_cycle(proxy, number, packet):
         return
     with proxy.client() as client:
         if number % 4 == 1:
+            # An incomplete checked request never reaches the storage.
             client.sendall(packet[:-12])
-            with proxy.peer() as peer:
-                client.close()
-                eof(peer)
         elif number % 4 == 2:
             client.sendall(packet)
             with proxy.peer() as peer:
